@@ -22,20 +22,15 @@ def main():
     build_headless = get_build_env_var_by_name("headless")
     build_java = "ON" if get_build_env_var_by_name("java") else "OFF"
 
-    if sys.version_info[:2] >= (3, 6):
-        minimum_supported_numpy = "1.13.3"
-    if sys.version_info[:2] >= (3, 7):
-        minimum_supported_numpy = "1.14.5"
-    if sys.version_info[:2] >= (3, 8):
-        minimum_supported_numpy = "1.17.3"
-    if sys.version_info[:2] >= (3, 9):
-        minimum_supported_numpy = "1.19.3"
-
-    # arm64 is a special case
-    if sys.version_info[:2] >= (3, 6) and platform.machine() == "aarch64":
-        minimum_supported_numpy = "1.19.3"
-
-    numpy_version = "numpy>=%s" % minimum_supported_numpy
+    install_requires = [
+        'numpy>=1.13.3; python_version<"3.7"',
+        'numpy>=1.14.5; python_version>="3.7"',
+        'numpy>=1.17.3; python_version>="3.8"',
+        'numpy>=1.19.3; python_version>="3.9"',
+        'numpy>=1.21.2; python_version>="3.10"',
+        'numpy>=1.19.3; python_version>="3.6" and platform_system=="Linux" and platform_machine=="aarch64"',
+        'numpy>=1.21.2; python_version>="3.6" and platform_system=="Darwin" and platform_machine=="arm64"',
+    ]
 
     python_version = cmaker.CMaker.get_python_version()
     python_lib_path = cmaker.CMaker.get_python_library(python_version).replace(
@@ -65,7 +60,7 @@ def main():
     )
 
     # https://stackoverflow.com/questions/1405913/python-32bit-or-64bit-mode
-    x64 = sys.maxsize > 2 ** 32
+    is64 = sys.maxsize > 2 ** 32
 
     package_name = "opencv-python"
 
@@ -93,7 +88,7 @@ def main():
     # Path regexes with forward slashes relative to CMake install dir.
     rearrange_cmake_output_data = {
         "cv2": (
-            [r"bin/opencv_videoio_ffmpeg\d{3}%s\.dll" % ("_64" if x64 else "")]
+            [r"bin/opencv_videoio_ffmpeg\d{3}%s\.dll" % ("_64" if is64 else "")]
             if os.name == "nt"
             else []
         )
@@ -102,11 +97,31 @@ def main():
         # Naming conventions vary so widely between versions and OSes
         # had to give up on checking them.
         [
-            "python/cv2[^/]*%(ext)s"
-            % {"ext": re.escape(sysconfig.get_config_var("EXT_SUFFIX"))}
+            r"python/cv2/python-%s/cv2.*"
+            % (sys.version_info[0])
+        ]
+        +
+        [
+            r"python/cv2/__init__.py"
+        ]
+        +
+        [
+            r"python/cv2/.*config.*.py"
         ],
         "cv2.data": [  # OPENCV_OTHER_INSTALL_PATH
             ("etc" if os.name == "nt" else "share/opencv4") + r"/haarcascades/.*\.xml"
+        ],
+        "cv2.gapi": [
+            "python/cv2" + r"/gapi/.*\.py"
+        ],
+        "cv2.mat_wrapper": [
+            "python/cv2" + r"/mat_wrapper/.*\.py"
+        ],
+        "cv2.misc": [
+            "python/cv2" + r"/misc/.*\.py"
+        ],
+        "cv2.utils": [
+            "python/cv2" + r"/utils/.*\.py"
         ],
     }
 
@@ -115,7 +130,7 @@ def main():
     files_outside_package_dir = {"cv2": ["LICENSE.txt", "LICENSE-3RD-PARTY.txt"]}
 
     ci_cmake_generator = (
-        ["-G", "Visual Studio 14" + (" Win64" if x64 else "")]
+        ["-G", "Visual Studio 14" + (" Win64" if is64 else "")]
         if os.name == "nt"
         else ["-G", "Unix Makefiles"]
     )
@@ -131,8 +146,6 @@ def main():
             "-DBUILD_opencv_python2=OFF",
             # Disable the Java build by default as it is not needed
             "-DBUILD_opencv_java=%s" % build_java,
-            # When off, adds __init__.py and a few more helper .py's. We use our own helper files with a different structure.
-            "-DOPENCV_SKIP_PYTHON_LOADER=ON",
             # Relative dir to install the built module to in the build tree.
             # The default is generated from sysconfig, we'd rather have a constant for simplicity
             "-DOPENCV_PYTHON3_INSTALL_PATH=python",
@@ -141,11 +154,26 @@ def main():
             "-DINSTALL_CREATE_DISTRIB=ON",
             # See opencv/CMakeLists.txt for options and defaults
             "-DBUILD_opencv_apps=OFF",
+            "-DBUILD_opencv_freetype=OFF",
             "-DBUILD_SHARED_LIBS=OFF",
             "-DBUILD_TESTS=OFF",
             "-DBUILD_PERF_TESTS=OFF",
             "-DBUILD_DOCS=OFF",
+            "-DPYTHON3_LIMITED_API=ON",
+            "-DBUILD_OPENEXR=ON",
         ]
+        + (
+            # CMake flags for windows/arm64 build
+            ["-DCMAKE_GENERATOR_PLATFORM=ARM64",
+             # Emulated cmake requires following flags to correctly detect
+             # target architecture for windows/arm64 build
+             "-DOPENCV_WORKAROUND_CMAKE_20989=ON",
+             "-DCMAKE_SYSTEM_PROCESSOR=ARM64"]
+            if platform.machine() == "ARM64" and sys.platform == "win32"
+            # If it is not defined 'linker flags: /machine:X86' on Windows x64
+            else ["-DCMAKE_GENERATOR_PLATFORM=x64"] if is64 and sys.platform == "win32"
+            else []
+          )
         + (
             ["-DOPENCV_EXTRA_MODULES_PATH=" + os.path.abspath("opencv_contrib/modules")]
             if build_contrib
@@ -163,7 +191,7 @@ def main():
                 "-DWITH_MSMF=OFF"
             )  # see: https://github.com/skvark/opencv-python/issues/263
 
-    if sys.platform.startswith("linux") and not x64 and "bdist_wheel" in sys.argv:
+    if sys.platform.startswith("linux") and not is64 and "bdist_wheel" in sys.argv:
         subprocess.check_call("patch -p0 < patches/patchOpenEXR", shell=True)
 
     # OS-specific components during CI builds
@@ -226,7 +254,7 @@ def main():
         package_data=package_data,
         maintainer="Olli-Pekka Heinisuo",
         ext_modules=EmptyListWithLength(),
-        install_requires=numpy_version,
+        install_requires=install_requires,
         python_requires=">=3.6",
         classifiers=[
             "Development Status :: 5 - Production/Stable",
@@ -247,6 +275,7 @@ def main():
             "Programming Language :: Python :: 3.7",
             "Programming Language :: Python :: 3.8",
             "Programming Language :: Python :: 3.9",
+            "Programming Language :: Python :: 3.10",
             "Programming Language :: C++",
             "Programming Language :: Python :: Implementation :: CPython",
             "Topic :: Scientific/Engineering",
@@ -345,6 +374,13 @@ class RearrangeCMakeOutput(object):
 
         print("Copying files from CMake output")
 
+        # add lines from the old __init__.py file to the config file
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts', '__init__.py'), 'r') as custom_init:
+            custom_init_data = custom_init.read()
+        with open('%spython/cv2/config-%s.py'
+        % (cmake_install_dir, sys.version_info[0]), 'w') as opencv_init_config:
+            opencv_init_config.write(custom_init_data)
+
         for package_name, relpaths_re in cls.package_paths_re.items():
             package_dest_reldir = package_name.replace(".", os.path.sep)
             for relpath_re in relpaths_re:
@@ -366,7 +402,8 @@ class RearrangeCMakeOutput(object):
                     final_install_relpaths.append(new_install_relpath)
                     del m, fslash_relpath, new_install_relpath
                 else:
-                    if not found:
+                    # gapi can be missed if ADE was not downloaded (network issue)
+                    if not found and "gapi" not in relpath_re:
                         raise Exception("Not found: '%s'" % relpath_re)
                 del r, found
 
@@ -405,7 +442,7 @@ class RearrangeCMakeOutput(object):
             data_files,
             # To get around a check that prepends source dir to paths and breaks package detection code.
             cmake_source_dir="",
-            cmake_install_dir=cmake_install_reldir,
+            _cmake_install_dir=cmake_install_reldir,
         )
 
 

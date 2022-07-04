@@ -12,13 +12,16 @@ function build_wheel {
 
 function bdist_wheel_cmd {
     # copied from multibuild's common_utils.sh
-    # add osx deployment target so it doesnt default to 10.6
+    # add osx deployment target so it doesn't default to 10.6
     local abs_wheelhouse=$1
-    CI_BUILD=1 pip wheel --verbose --wheel-dir="$PWD/dist" . $BDIST_PARAMS
+    # install all required packages in pyproject.toml, because bdist_wheel does not do it
+    python${PYTHON_VERSION} -m pip install toml && python${PYTHON_VERSION} -c 'import toml; c = toml.load("pyproject.toml"); print("\n".join(c["build-system"]["requires"]))' | python${PYTHON_VERSION} -m pip install -r /dev/stdin
+    CI_BUILD=1 python${PYTHON_VERSION} setup.py bdist_wheel --py-limited-api=cp36 -v
     cp dist/*.whl $abs_wheelhouse
     if [ -z "$IS_OSX" ]; then
-      TOOLS_PATH=/opt/_internal/tools
-      /opt/python/cp37-cp37m/bin/python -m venv $TOOLS_PATH
+      # this path can be changed in the latest manylinux image
+      TOOLS_PATH=/opt/_internal/pipx/venvs/auditwheel
+      /opt/python/cp39-cp39/bin/python -m venv $TOOLS_PATH
       source $TOOLS_PATH/bin/activate
       python patch_auditwheel_whitelist.py
       deactivate
@@ -47,7 +50,7 @@ if [ -n "$IS_OSX" ]; then
     function generate_ffmpeg_formula {
         local FF="ffmpeg"
         local LFF="ffmpeg_opencv"
-        local FF_FORMULA; FF_FORMULA=$(brew formula "$FF")
+        local FF_FORMULA; FF_FORMULA=$(brew formula "${FF}${FFMPEG_FORMULA_VERSION}")
         local LFF_FORMULA; LFF_FORMULA="$(dirname "$FF_FORMULA")/${LFF}.rb"
 
         local REGENERATE
@@ -67,8 +70,9 @@ if [ -n "$IS_OSX" ]; then
         if [ -n "$REGENERATE" ]; then
             echo "Regenerating custom ffmpeg formula"
             # Bottle block syntax: https://docs.brew.sh/Bottles#bottle-dsl-domain-specific-language
+            # FfmpegAT4 is a class in ffmpeg@4 formula
             perl -wpe 'BEGIN {our ($found_blank, $bottle_block);}
-                if (/(^class )(Ffmpeg)(\s.*)/) {$_=$1.$2."Opencv".$3."\n"; next;}
+                if (/(^class )(FfmpegAT4)(\s.*)/) {$_=$1."FfmpegOpencv".$3."\n"; next;}
                 if (!$found_blank && /^$/) {$_.="conflicts_with \"ffmpeg\"\n\n"; $found_blank=1; next;}
                 if (!$bottle_block && /^\s*bottle do$/) { $bottle_block=1; next; }
                 if ($bottle_block) { if (/^\s*end\s*$/) { $bottle_block=0} elsif (/^\s*sha256\s/) {$_=""} next; }
@@ -93,37 +97,24 @@ function pre_build {
   set -e -o pipefail
 
   if [ -n "$IS_OSX" ]; then
+    brew install lapack
+  fi
+
+  if [ -n "$IS_OSX" ]; then
     echo "Running for OSX"
 
-    local CACHE_STAGE; (echo "$TRAVIS_BUILD_STAGE_NAME" | grep -qiF "final") || CACHE_STAGE=1
+    local CACHE_STAGE;# (echo "$TRAVIS_BUILD_STAGE_NAME" | grep -qiF "final") || CACHE_STAGE=1
+    CACHE_STAGE=
     export HOMEBREW_NO_AUTO_UPDATE=1
-
-    #after the cache stage, all bottles and Homebrew metadata should be already cached locally
-    if [ -n "$CACHE_STAGE" ]; then
-        brew update
-        generate_ffmpeg_formula
-        brew_add_local_bottles
-    fi
 
     echo 'Installing FFmpeg'
 
-    if [ -n "$CACHE_STAGE" ]; then
-        brew_install_and_cache_within_time_limit ffmpeg_opencv || { [ $? -gt 1 ] && return 2 || return 0; }
-    else
-        brew unlink python@2
-        generate_ffmpeg_formula
-        brew install ffmpeg_opencv
-    fi
-
-    # echo 'Installing qt5'
-    
-    # if [ -n "$CACHE_STAGE" ]; then
-    #    echo "Qt5 has bottle, no caching needed"
-    # else
-    #    brew switch qt 5.13.2
-    #    brew pin qt
-    #    export PATH="/usr/local/opt/qt/bin:$PATH"
-    # fi
+    brew update
+    generate_ffmpeg_formula
+    brew_add_local_bottles
+    brew install --build-bottle ffmpeg_opencv
+    # It needs when we use not the latest ffmpeg formula
+    brew link ffmpeg_opencv
 
     if [ -n "$CACHE_STAGE" ]; then
         brew_go_bootstrap_mode 0
@@ -143,24 +134,38 @@ function run_tests {
     echo "Run tests..."
     echo $PWD
 
-    if [ -n "$IS_OSX" ]; then
-      echo "Running for OS X"
-      cd ../tests/
-    else
-      echo "Running for linux"
-      cd /io/tests/
+    PYTHON=python$PYTHON_VERSION
+
+    echo "Running for linux"
+
+    if [ $PYTHON == "python3.6" ]; then
+      $PYTHON -m pip install -U numpy==1.19.4
     fi
+    cd /io/tests
+    $PYTHON get_build_info.py
+
+    cd /io/opencv
+    export OPENCV_TEST_DATA_PATH=/io/opencv_extra/testdata
 
     test_wheels
+    pylint_test
 }
 
 function test_wheels {
-    PYTHON=python$PYTHON_VERSION
 
-    echo "Starting tests..."
+    echo "Starting OpenCV tests..."
 
     #Test package
-    $PYTHON -m unittest test
+    $PYTHON modules/python/test/test.py -v --repo .
+}
+
+function pylint_test {
+
+    echo "Starting Pylint tests..."
+
+    $PYTHON -m pip install pylint==2.12.2
+    cd /io/tests
+    $PYTHON -m pylint /io/opencv/samples/python/squares.py
 }
 
 export PS4='+(${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
